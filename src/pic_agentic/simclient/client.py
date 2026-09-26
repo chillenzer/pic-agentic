@@ -12,6 +12,7 @@ command.  It has no arbitrary-shell surface.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from pathlib import Path
@@ -25,10 +26,13 @@ from pic_agentic.protocol.simulation import (
     SimulationStage,
     SimulationState,
     SimulationType,
+    build_logs_ack,
+    build_status_ack,
     build_submit_ack,
     build_submit_event,
 )
 from pic_agentic.rcp import DedupStore, Kind, RcpMessage, SenderRole, SequenceState
+from pic_agentic.simclient.follow import JobFollower, TrackedSim
 from pic_agentic.simclient.safety import safe_write_message
 from pic_agentic.simclient.simulation import (
     PreparedSubmit,
@@ -36,10 +40,11 @@ from pic_agentic.simclient.simulation import (
     SimulationExecutionError,
     SubmitConfig,
     execute_submit,
+    find_stdout_path,
     parse_payload,
     prepare_submit,
 )
-from pic_agentic.slurm import JobInfo, SlurmClient, SlurmError
+from pic_agentic.slurm import JobInfo, SlurmClient, SlurmError, SlurmJobState
 from pic_agentic.version import local_provenance as _local_provenance
 
 if TYPE_CHECKING:
@@ -50,6 +55,28 @@ log = logging.getLogger(__name__)
 #: Upper bound on retained idempotency records, so the durable file cannot grow
 #: without limit on a long-lived message directory.
 _MAX_PROCESSED = 4096
+
+#: M2 commands gated by the presence of a cluster-local ``submit_config``.
+_M2_COMMANDS = frozenset(
+    {SimulationType.COMMAND, SimulationType.STATUS_COMMAND, SimulationType.LOGS_COMMAND},
+)
+
+#: Default first (and reset) poll interval for the job-follow watcher, per the
+#: M2b plan (30 s -> 5 min adaptive backoff); overridable per instance and via
+#: ``PIC_AGENTIC_POLL_INTERVAL_S``.
+DEFAULT_POLL_INTERVAL_S = 30.0
+
+#: Default cap for the watcher's backing-off poll interval (the plan's 5 min).
+DEFAULT_POLL_MAX_INTERVAL_S = 300.0
+
+#: Assume a log line is at most this long when sizing the tail read window; a
+#: longer line is still returned in full once the window is aligned to a
+#: newline, but may cover fewer than ``tail`` lines.
+_ASSUMED_MAX_LINE_BYTES = 4096
+
+#: Hard cap on the bytes a single ``get_logs`` reads from the end of a stream,
+#: so an unbounded PIConGPU ``stdout`` cannot OOM the simclient.
+_MAX_LOG_READ_BYTES = 8 * 1024 * 1024
 
 
 class HelloResult(BaseModel):
@@ -110,6 +137,7 @@ class SimClient:
         message_dir: Path,
         job_wait_timeout_s: float = 60.0,
         poll_interval_s: float = 0.2,
+        poll_max_interval_s: float = 300.0,
         allowed_sender_user_id: str | None = None,
         submit_config: SubmitConfig | None = None,
     ) -> None:
@@ -122,7 +150,9 @@ class SimClient:
             slurm: The SLURM command layer.
             message_dir: Shared-filesystem base directory for payload files.
             job_wait_timeout_s: Maximum wait for a submitted job.
-            poll_interval_s: Delay between ``scontrol`` polls.
+            poll_interval_s: Initial (and reset) interval between ``scontrol``
+                polls in the job-follow watcher; also the ``hello`` wait loop.
+            poll_max_interval_s: Cap for the watcher's backing-off interval.
             allowed_sender_user_id: Optional expected MCP-server identity.
             submit_config: Cluster-local policy for ``submit_simulation``;
                 when omitted the M2 handler is disabled.
@@ -135,10 +165,22 @@ class SimClient:
         self.message_dir = message_dir
         self.job_wait_timeout_s = job_wait_timeout_s
         self.poll_interval_s = poll_interval_s
+        self.poll_max_interval_s = poll_max_interval_s
         self.allowed_sender_user_id = allowed_sender_user_id
         self.submit_config = submit_config
         self.sequences = SequenceState()
         self.seen = DedupStore()
+        #: Per-sim follow-state and detached watcher tasks, keyed by ``sim_id``.
+        self._tracked: dict[str, TrackedSim] = {}
+        #: Current watcher per ``sim_id`` (the latest run).
+        self._follow_tasks: dict[str, asyncio.Task[None]] = {}
+        #: Every live watcher task, including a superseded one still winding
+        #: down, so shutdown reaps orphans the dict slot no longer points at.
+        self._follow_tasks_all: set[asyncio.Task[None]] = set()
+        #: Detached watchers are started only while :meth:`serve` owns the event
+        #: loop, so a direct ``handle`` call in a test does not leave a task
+        #: (and its subprocesses) running past the test.
+        self._serving = False
         #: Command ids already executed, mapped to their result.  Persisted
         #: under ``message_dir`` so a restart that backfills the room does not
         #: re-submit cluster jobs for commands it already ran, and so a replay
@@ -183,11 +225,65 @@ class SimClient:
         self.sequences.observe(message.sim, message.sender_role, message.seq)
         if message.type == HelloType.COMMAND:
             return await self._handle_hello(message)
-        if message.type == SimulationType.COMMAND:
+        if message.type in _M2_COMMANDS:
             if self.submit_config is None:
-                return await self._reject_submit(message, error="rejected_by_policy")
-            return await self._handle_submit(message)
+                return await self._reject_m2(message, error="rejected_by_policy")
+            return await self._dispatch_m2(message)
         return await self._ack(message, cmd_id=message.payload.get("cmd_id"), error="rejected_by_policy")
+
+    async def _dispatch_m2(self, message: RcpMessage) -> RcpMessage:
+        """Dispatch one of the M2 commands to its handler.
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        if message.type == SimulationType.COMMAND:
+            return await self._handle_submit(message)
+        if message.type == SimulationType.STATUS_COMMAND:
+            return await self._handle_status(message)
+        return await self._handle_logs(message)
+
+    async def _reject_m2(self, message: RcpMessage, *, error: str) -> RcpMessage:
+        """Reject an M2 command when the cluster-local handler is disabled.
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        if message.type == SimulationType.COMMAND:
+            return await self._reject_submit(message, error=error)
+        return await self._reject_pull(message, error=error)
+
+    async def _reject_pull(self, message: RcpMessage, *, error: str) -> RcpMessage:
+        """Send a status/logs-shaped rejection.
+
+        Returns:
+            The signed acknowledgement that was sent.
+
+        """
+        if message.type == SimulationType.LOGS_COMMAND:
+            ack = self._build_logs_ack(
+                message,
+                cmd_id=str(message.payload.get("cmd_id", "")),
+                sim_id=str(message.payload.get("sim_id", "")),
+                stream=str(message.payload.get("stream", "stdout")),
+                lines=[],
+                total_lines=0,
+                error=error,
+                error_code=SimulationErrorCode.REJECTED,
+            )
+        else:
+            ack = self._build_status_ack(
+                message,
+                cmd_id=str(message.payload.get("cmd_id", "")),
+                sim_id=str(message.payload.get("sim_id", "")),
+                state=SimulationState.FAILED.value,
+                error=error,
+                error_code=SimulationErrorCode.REJECTED,
+            )
+        await self.transport.send(ack)
+        return ack
 
     async def _reject_submit(
         self,
@@ -545,7 +641,280 @@ class SimClient:
                     state=str(result.get("state", SimulationState.WORKFLOW_FINISHED.value)),
                 )
             )
+        await self._start_follower(
+            cmd_id=cmd_id,
+            sim_id=str(result.get("sim_id", sim_id)),
+            job_id=result.get("job_id"),
+            run_dir=str(result.get("run_dir", "")),
+            stdout_path=result.get("stdout_path"),
+            submit_system=prepared.params.submit_system,
+        )
         return accepted
+
+    async def _start_follower(
+        self,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        job_id: int | None,
+        run_dir: str,
+        stdout_path: str | None,
+        submit_system: str,
+    ) -> None:
+        """Store follow-state and start the detached watcher for one simulation.
+
+        The watcher is skipped for a submit system with neither a scheduler job
+        id nor an ``sbatch`` contract (e.g. local ``bash`` execution): there is
+        no job to follow and the workflow already finished synchronously.
+        """
+        if not self._serving or (job_id is None and submit_system != "sbatch"):
+            return
+        tracked = TrackedSim(
+            sim_id=sim_id,
+            cmd_id=cmd_id,
+            job_id=job_id,
+            run_dir=run_dir,
+            stdout_path=stdout_path,
+            submit_system=submit_system,
+        )
+        # A resubmission of an identical simulation yields the same ``sim_id``
+        # (payload-hash prefix).  Cancel the previous watcher *before* replacing
+        # it, so it cannot keep polling and emitting under its stale ``cmd_id``;
+        # keep it in ``_follow_tasks_all`` until it has actually finished so
+        # shutdown reaps it even after the dict slot is reused.
+        previous = self._follow_tasks.pop(sim_id, None)
+        if previous is not None:
+            previous.cancel()
+            self._follow_tasks_all.add(previous)
+            previous.add_done_callback(self._follow_tasks_all.discard)
+            # Await it so the cancelled watcher's in-flight ``scontrol``
+            # subprocess is reaped before the replacement starts (the follower
+            # shields its poll for exactly this reason).
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await previous
+        self._tracked[sim_id] = tracked
+
+        async def emit(state: SimulationState, *, job_id: int | None = None, **fields: object) -> None:
+            event = self._build_submit_event(cmd_id=cmd_id, sim_id=sim_id, state=state, job_id=job_id, **fields)
+            await self.transport.send(event)
+
+        follower = JobFollower(
+            sim=self.sim,
+            emit=emit,
+            tracked=tracked,
+            job_info=self.slurm.job_info,
+            initial_interval_s=self.poll_interval_s,
+            max_interval_s=self.poll_max_interval_s,
+        )
+        task = asyncio.create_task(follower.run())
+        self._follow_tasks[sim_id] = task
+        self._follow_tasks_all.add(task)
+        task.add_done_callback(self._follow_tasks_all.discard)
+
+    async def _cancel_followers(self) -> None:
+        """Stop and await every detached watcher task (idempotent).
+
+        Cancels both the current per-``sim_id`` watchers and any superseded
+        (orphaned) watcher still winding down, then awaits them all.
+        """
+        tasks = set(self._follow_tasks.values()) | self._follow_tasks_all
+        for follower_task in tasks:
+            follower_task.cancel()
+        for follower_task in tasks:
+            # A cancelled follower raises CancelledError; a follower that crashed
+            # before cancellation may raise its stored exception.  Best-effort.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await follower_task
+        self._follow_tasks.clear()
+        self._follow_tasks_all.clear()
+
+    @staticmethod
+    def _state_for_info(info: JobInfo, run_dir: str) -> str:
+        """Map a live SLURM snapshot to a coarse lifecycle state.
+
+        Returns:
+            The :class:`SimulationState` value to report in a status ack.
+
+        """
+        if info.state is SlurmJobState.COMPLETED and info.exit_code in {None, 0}:
+            if run_dir and (Path(run_dir) / "simOutput").exists():
+                return SimulationState.RESULTS_READY.value
+            return SimulationState.JOB_FINISHED.value
+        mapping = {
+            SlurmJobState.PENDING: SimulationState.SUBMITTED,
+            SlurmJobState.RUNNING: SimulationState.JOB_RUNNING,
+            SlurmJobState.COMPLETING: SimulationState.JOB_RUNNING,
+            SlurmJobState.COMPLETED: SimulationState.JOB_FINISHED,
+            SlurmJobState.FAILED: SimulationState.JOB_FAILED,
+            SlurmJobState.CANCELLED: SimulationState.JOB_FAILED,
+            SlurmJobState.TIMEOUT: SimulationState.JOB_FAILED,
+            SlurmJobState.UNKNOWN: SimulationState.WORKFLOW_FINISHED,
+        }
+        return mapping[info.state].value
+
+    async def _handle_status(self, message: RcpMessage) -> RcpMessage:
+        """Answer a ``status_request`` with a live or last-known snapshot.
+
+        Errors are reported as data in the ack, never raised: a status pull
+        must not tear down the serve loop.
+
+        Returns:
+            The signed ``status_ack`` that was sent.
+
+        """
+        cmd_id = str(message.payload.get("cmd_id", ""))
+        sim_id = str(message.payload.get("sim_id", ""))
+        tracked = self._tracked.get(sim_id)
+        if tracked is None:
+            ack = self._build_status_ack(
+                message,
+                cmd_id=cmd_id,
+                sim_id=sim_id,
+                state=SimulationState.FAILED.value,
+                error="unknown_sim",
+                error_code="unknown_sim",
+            )
+            await self.transport.send(ack)
+            return ack
+        state = SimulationState.WORKFLOW_FINISHED.value
+        slurm_state: str | None = None
+        exit_code: int | None = None
+        error: str | None = None
+        error_code: str | None = None
+        if tracked.job_id is not None:
+            try:
+                info = await self.slurm.job_info(tracked.job_id)
+                state = self._state_for_info(info, tracked.run_dir)
+                slurm_state = info.state.value
+                exit_code = info.exit_code
+            except Exception as exc:  # ruff: ignore[blind-except] - a transient scontrol failure is ack data
+                log.warning("status query failed for sim %s: %s", sim_id, exc)
+                error = f"job_info_failed:{exc}"
+                error_code = "job_info_failed"
+        ack = self._build_status_ack(
+            message,
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            state=state,
+            slurm_state=slurm_state,
+            job_id=tracked.job_id,
+            step=tracked.last_step,
+            percent=tracked.last_percent if tracked.last_percent >= 0 else None,
+            walltime=tracked.last_walltime,
+            avg_per_step=tracked.last_avg_per_step,
+            eta_s=tracked.last_eta_s,
+            exit_code=exit_code,
+            error=error,
+            error_code=error_code,
+        )
+        await self.transport.send(ack)
+        return ack
+
+    @staticmethod
+    def _log_path(tracked: TrackedSim, stream: str) -> Path | None:
+        """Resolve the on-disk file backing a log stream.
+
+        Returns:
+            The file path to read, or None when the stream has no known file.
+
+        """
+        run_dir = Path(tracked.run_dir)
+        if stream == "stdout":
+            if tracked.stdout_path and Path(tracked.stdout_path).is_file():
+                return Path(tracked.stdout_path)
+            return run_dir / "stdout"
+        if stream == "stderr":
+            return run_dir / "stderr"
+        discovered = find_stdout_path(run_dir)
+        return Path(discovered) if discovered else None
+
+    @staticmethod
+    def _read_tail(path: Path, tail: int) -> tuple[list[str], int]:
+        """Read up to ``tail`` trailing lines without slurping the whole file.
+
+        The read window is bounded by :data:`_MAX_LOG_READ_BYTES`, so a
+        multi-hundred-MB PIConGPU ``stdout`` cannot OOM the simclient.  When
+        the window does not reach the start of the file the first (partial)
+        line is dropped, and ``total_lines`` then counts only the lines in the
+        window (the true total is unknowable without reading everything).
+
+        Args:
+            path: The log file to read.
+            tail: Maximum number of trailing lines to return.
+
+        Returns:
+            The ``(lines, total_lines)`` pair; ``([], 0)`` on an unreadable file.
+
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return [], 0
+        window = min(_MAX_LOG_READ_BYTES, max(tail, 1) * _ASSUMED_MAX_LINE_BYTES + 1)
+        start = max(0, size - window)
+        try:
+            with path.open("rb") as handle:
+                handle.seek(start)
+                data = handle.read()
+        except OSError:
+            return [], 0
+        if start > 0:
+            newline = data.find(b"\n")
+            # No newline in the window means a single line longer than the
+            # whole window; report nothing rather than a bogus partial line.
+            if newline < 0:
+                return [], 0
+            data = data[newline + 1 :]
+        all_lines = data.decode("utf-8", errors="replace").splitlines()
+        return (all_lines[-tail:] if tail else []), len(all_lines)
+
+    async def _handle_logs(self, message: RcpMessage) -> RcpMessage:
+        """Answer a ``logs_request`` with up to ``tail`` lines of a stream.
+
+        A missing file is reported as an empty log (not an error).  Errors are
+        ack data, never raised.
+
+        Returns:
+            The signed ``logs_ack`` that was sent.
+
+        """
+        cmd_id = str(message.payload.get("cmd_id", ""))
+        sim_id = str(message.payload.get("sim_id", ""))
+        stream = str(message.payload.get("stream", "stdout"))
+        try:
+            tail = int(message.payload.get("tail", 100))
+        except (TypeError, ValueError):
+            tail = 100
+        tail = max(0, min(tail, 10_000))
+        tracked = self._tracked.get(sim_id)
+        if tracked is None:
+            ack = self._build_logs_ack(
+                message,
+                cmd_id=cmd_id,
+                sim_id=sim_id,
+                stream=stream,
+                lines=[],
+                total_lines=0,
+                error="unknown_sim",
+                error_code="unknown_sim",
+            )
+            await self.transport.send(ack)
+            return ack
+        lines: list[str] = []
+        total = 0
+        path = self._log_path(tracked, stream)
+        if path is not None:
+            lines, total = await asyncio.to_thread(self._read_tail, path, tail)
+        ack = self._build_logs_ack(
+            message,
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            stream=stream,
+            lines=lines,
+            total_lines=total,
+        )
+        await self.transport.send(ack)
+        return ack
 
     @staticmethod
     def _read_submission_job_id(run_dir: Path, _payload: object) -> int | None:
@@ -585,6 +954,68 @@ class SimClient:
             error_code=error_code,
         ).sign(self.secret)
 
+    def _build_status_ack(
+        self,
+        message: RcpMessage,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        state: str,
+        slurm_state: str | None = None,
+        job_id: int | None = None,
+        step: int | None = None,
+        percent: int | None = None,
+        walltime: str | None = None,
+        avg_per_step: str | None = None,
+        eta_s: int | None = None,
+        exit_code: int | None = None,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> RcpMessage:
+        return build_status_ack(
+            sim=self.sim,
+            seq=self.sequences.next_seq(self.sim, SenderRole.SIMCLIENT),
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            in_reply_to=message.transport_event_id,
+            state=state,
+            slurm_state=slurm_state,
+            job_id=job_id,
+            step=step,
+            percent=percent,
+            walltime=walltime,
+            avg_per_step=avg_per_step,
+            eta_s=eta_s,
+            exit_code=exit_code,
+            error=error,
+            error_code=error_code,
+        ).sign(self.secret)
+
+    def _build_logs_ack(
+        self,
+        message: RcpMessage,
+        *,
+        cmd_id: str,
+        sim_id: str,
+        stream: str,
+        lines: list[str],
+        total_lines: int,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> RcpMessage:
+        return build_logs_ack(
+            sim=self.sim,
+            seq=self.sequences.next_seq(self.sim, SenderRole.SIMCLIENT),
+            cmd_id=cmd_id,
+            sim_id=sim_id,
+            in_reply_to=message.transport_event_id,
+            stream=stream,
+            lines=lines,
+            total_lines=total_lines,
+            error=error,
+            error_code=error_code,
+        ).sign(self.secret)
+
     def _build_submit_event(
         self,
         *,
@@ -597,6 +1028,13 @@ class SimClient:
         error_code: str | None = None,
         submit_system: str | None = None,
         results_linked: bool | None = None,
+        step: int | None = None,
+        percent: int | None = None,
+        walltime: str | None = None,
+        avg_per_step: str | None = None,
+        eta_s: int | None = None,
+        slurm_state: str | None = None,
+        exit_code: int | None = None,
     ) -> RcpMessage:
         return build_submit_event(
             sim=self.sim,
@@ -610,6 +1048,13 @@ class SimClient:
             error_code=error_code,
             submit_system=submit_system,
             results_linked=results_linked,
+            step=step,
+            percent=percent,
+            walltime=walltime,
+            avg_per_step=avg_per_step,
+            eta_s=eta_s,
+            slurm_state=slurm_state,
+            exit_code=exit_code,
         ).sign(self.secret)
 
     async def _ack(self, message: RcpMessage, *, cmd_id: object, error: str) -> RcpMessage:
@@ -644,10 +1089,15 @@ class SimClient:
             asyncio.CancelledError: If the serving task is cancelled.
 
         """
-        async for message in self.transport.receive():
-            try:
-                await self.handle(message)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("error handling inbound RCP message")
+        self._serving = True
+        try:
+            async for message in self.transport.receive():
+                try:
+                    await self.handle(message)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("error handling inbound RCP message")
+        finally:
+            self._serving = False
+            await self._cancel_followers()

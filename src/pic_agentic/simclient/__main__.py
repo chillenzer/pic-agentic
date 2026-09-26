@@ -18,6 +18,7 @@ from pathlib import Path
 from pic_agentic.auth import MasTokenStore
 from pic_agentic.config import Config
 from pic_agentic.simclient import SimClient
+from pic_agentic.simclient.client import DEFAULT_POLL_INTERVAL_S, DEFAULT_POLL_MAX_INTERVAL_S
 from pic_agentic.simclient.simulation import SubmitConfig
 from pic_agentic.slurm import SlurmClient
 from pic_agentic.transport.matrix import MatrixTransport
@@ -56,7 +57,8 @@ async def run() -> None:
         slurm=SlurmClient(bin_dir=config.slurm_bin_dir, timeout_s=config.job_wait_timeout_s + 10),
         message_dir=message_dir,
         job_wait_timeout_s=config.job_wait_timeout_s,
-        poll_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_INTERVAL_S", "5")),
+        poll_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_INTERVAL_S", str(DEFAULT_POLL_INTERVAL_S))),
+        poll_max_interval_s=float(os.environ.get("PIC_AGENTIC_POLL_MAX_INTERVAL_S", str(DEFAULT_POLL_MAX_INTERVAL_S))),
         allowed_sender_user_id=os.environ.get("PIC_AGENTIC_ALLOWED_SENDER"),
         submit_config=submit_config,
     )

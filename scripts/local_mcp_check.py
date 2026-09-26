@@ -22,7 +22,8 @@ Three modes:
   (``PIC_AGENTIC_PICONGPU_PYTHON`` may point at another interpreter).
 
 * ``--watch`` reads the RCP room and prints the lifecycle events
-  (``simulation.submitted``/``workflow.finished``/``simulation.failed``) as they
+  (``simulation.submitted``/``workflow.finished``/``simulation.job_*``/
+  ``results.ready``/``simulation.failed``) as they
   arrive, until ``--wait-s`` elapses.  Use it in a second terminal after
   ``--submit`` to follow the run.
 
@@ -293,15 +294,71 @@ def cmd_submit(args: argparse.Namespace) -> int:
         print("\nFAILED: the submit command was not accepted.", file=sys.stderr)
         return 1
     print(f"\nSUBMIT ACCEPTED: sim_id={result.get('sim_id')} state={result.get('state')}")
-    print("Watch the room / run --run later for the simulation.submitted and workflow.finished events.")
+    print("Watch the room / run --watch to follow the run to results.ready.")
     return 0
+
+
+def _call_report_tool(state: dict, tool: str, arguments: dict) -> int:
+    """Drive the MCP server and call one M2b reporting tool once.
+
+    A fresh server process backfills the room into its registry on startup, so
+    ``get_status``/``list_simulations``/``get_events`` see prior history.
+
+    Returns:
+        The process exit code.
+
+    """
+    try:
+        result = asyncio.run(_call_tool(state, tool, arguments))
+    except Exception as exc:  # ruff: ignore[blind-except] - surfaced as data normally
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    print(json.dumps(result, indent=2, default=str), flush=True)
+    return 0 if "error" not in result else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Call ``get_status`` / ``list_simulations`` / ``get_events`` on the room.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    if args.events:
+        return _call_report_tool(state, "get_events", {"sim_id": args.sim_id, "limit": 50})
+    if args.sim_id:
+        return _call_report_tool(state, "get_status", {"sim_id": args.sim_id})
+    return _call_report_tool(state, "list_simulations", {"active_only": False})
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Call ``get_logs`` for one sim on the room.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        SystemExit: If no setup state exists.
+
+    """
+    if not args.state.exists():
+        msg = f"no state at {args.state}; run --setup first"
+        raise SystemExit(msg)
+    state = json.loads(args.state.read_text())
+    return _call_report_tool(state, "get_logs", {"sim_id": args.sim_id, "stream": args.stream, "tail": args.tail})
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
     """Read the RCP room and print lifecycle events until the wait expires.
 
     Returns:
-        The process exit code (0 on ``workflow.finished``, 1 on failure/timeout).
+        The process exit code (0 on ``results.ready``, 1 on failure/timeout).
 
     Raises:
         SystemExit: If no setup state exists.
@@ -361,17 +418,25 @@ async def _watch(state: dict, wait_s: float) -> int:
 def _print_event(message) -> int | None:
     if not message.type.startswith("rcp.simulation"):
         return None
-    state = message.payload.get("state")
-    job_id = message.payload.get("job_id")
-    print(f"[{message.type}] state={state} job_id={job_id}", flush=True)
-    error = message.payload.get("error")
+    payload = message.payload
+    state = payload.get("state")
+    job_id = payload.get("job_id")
+    detail = ""
+    if state == "simulation.step_finished":
+        detail = f" step={payload.get('step')} percent={payload.get('percent')} eta_s={payload.get('eta_s')}"
+    elif state in {"simulation.job_finished", "simulation.job_failed"}:
+        detail = f" slurm_state={payload.get('slurm_state')} exit_code={payload.get('exit_code')}"
+    print(f"[{message.type}] state={state} job_id={job_id}{detail}", flush=True)
+    error = payload.get("error")
     if error:
         print(f"    error: {error}", flush=True)
-    if state == "workflow.finished":
-        linked = message.payload.get("results_linked")
-        print(f"\nWORKFLOW FINISHED (results linked: {linked}).", flush=True)
+    # M2b: `workflow.finished` is no longer terminal (the job may still run).
+    # Only `results.ready` (results linked) is success; job/sim failures are not.
+    if state == "results.ready":
+        linked = payload.get("results_linked")
+        print(f"\nRESULTS READY (results linked: {linked}).", flush=True)
         return 0
-    if state == "simulation.failed":
+    if state in {"simulation.failed", "simulation.job_failed"}:
         print("\nSIMULATION FAILED.", file=sys.stderr, flush=True)
         return 1
     return None
@@ -390,9 +455,15 @@ def main() -> None:
     mode.add_argument("--run", action="store_true", help="drive the MCP server and send hello")
     mode.add_argument("--submit", action="store_true", help="drive the MCP server and call submit_simulation")
     mode.add_argument("--watch", action="store_true", help="follow lifecycle events in the RCP room")
+    mode.add_argument("--status", action="store_true", help="call get_status / list_simulations / get_events")
+    mode.add_argument("--logs", action="store_true", help="call get_logs for one sim")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--sim", default="cluster")
     parser.add_argument("--message", default=DEFAULT_MESSAGE)
+    parser.add_argument("--sim-id", default="", help="sim_id for --status/--logs")
+    parser.add_argument("--events", action="store_true", help="with --status: return get_events instead")
+    parser.add_argument("--stream", default="stdout", help="log stream for --logs")
+    parser.add_argument("--tail", type=int, default=100, help="log lines for --logs")
     parser.add_argument("--picmi-script", default="", help="PICMI script path for --submit")
     parser.add_argument(
         "--picongpu-python",
@@ -420,6 +491,10 @@ def main() -> None:
         raise SystemExit(cmd_submit(args))
     if args.watch:
         raise SystemExit(cmd_watch(args))
+    if args.status:
+        raise SystemExit(cmd_status(args))
+    if args.logs:
+        raise SystemExit(cmd_logs(args))
     raise SystemExit(cmd_run(args))
 
 

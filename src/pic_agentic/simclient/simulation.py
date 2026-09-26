@@ -493,6 +493,31 @@ def link_run_results(run_dir: Path) -> bool:
     return result.returncode == 0 and (run_dir / "simOutput").exists()
 
 
+def find_stdout_path(run_dir: Path) -> str | None:
+    """Locate the job's ``stdout`` inside the cwltool step cache.
+
+    The CWL step is submitted with ``#SBATCH -o stdout`` and a ``--chdir`` into
+    its per-step cache directory, so the SLURM output lands at
+    ``run_dir/.cwl_cache/*/stdout``.  The cache layout is internal to cwltool
+    (the plan's known risk), so discovery is a best-effort glob: when several
+    step caches match, the newest file (by mtime) wins.
+
+    Args:
+        run_dir: The runner's run directory.
+
+    Returns:
+        The absolute path to the newest matching ``stdout``, or None when the
+        cache carries none.
+
+    """
+    run_dir = Path(run_dir)
+    candidates = [path for path in run_dir.glob(".cwl_cache/*/stdout") if path.is_file()]
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda path: path.stat().st_mtime)
+    return str(newest)
+
+
 async def execute_submit(
     *,
     prepared: PreparedSubmit,
@@ -507,7 +532,7 @@ async def execute_submit(
         job_id_reader: Callable ``job_id_reader(run_dir, payload) -> int | None``.
 
     Returns:
-        ``{"sim_id", "state", "job_id"}``.
+        ``{"sim_id", "state", "job_id", "run_dir", "stdout_path"}``.
 
     Raises:
         SimulationExecutionError: On a build/run stage failure.
@@ -552,7 +577,14 @@ async def execute_submit(
     # with ``job_id=None``, so the lifecycle is not silently truncated.
     link_ready = await asyncio.to_thread(link_run_results, runner.run_dir)
     await emit(SimulationState.WORKFLOW_FINISHED, job_id=job_id, results_linked=link_ready)
-    return {"sim_id": prepared.payload.sim_id, "state": SimulationState.WORKFLOW_FINISHED.value, "job_id": job_id}
+    stdout_path = await asyncio.to_thread(find_stdout_path, runner.run_dir)
+    return {
+        "sim_id": prepared.payload.sim_id,
+        "state": SimulationState.WORKFLOW_FINISHED.value,
+        "job_id": job_id,
+        "run_dir": str(runner.run_dir),
+        "stdout_path": stdout_path,
+    }
 
 
 __all__ = [
@@ -562,5 +594,6 @@ __all__ = [
     "SubmitConfig",
     "check_payload_hash",
     "execute_submit",
+    "find_stdout_path",
     "prepare_submit",
 ]

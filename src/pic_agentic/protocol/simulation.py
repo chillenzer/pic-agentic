@@ -95,6 +95,12 @@ class SimulationType(StrEnum):
     COMMAND = "rcp.simulation_submit"
     ACK = "rcp.simulation_submit_ack"
     EVENT = "rcp.simulation_event"
+    #: M2b request/response: the MCP server asks the simclient (which sees the
+    #: cluster) for live status / logs; the simclient answers with an ``*_ACK``.
+    STATUS_COMMAND = "rcp.status_request"
+    STATUS_ACK = "rcp.status_ack"
+    LOGS_COMMAND = "rcp.logs_request"
+    LOGS_ACK = "rcp.logs_ack"
 
 
 class SimulationState(StrEnum):
@@ -103,13 +109,22 @@ class SimulationState(StrEnum):
     ``workflow.finished`` marks the end of the CWL workflow the simclient
     drives (build -> prepare -> submit -> organize).  It deliberately does not
     claim the SLURM job finished, nor that results exist: the job may still be
-    queued or running.  The design's ``results.ready`` is reserved for a later
-    job-state confirmation (deferred with per-stage events, upstream #55).
+    queued or running.
+
+    The ``simulation.job_*`` events (M2b) follow the SLURM job itself:
+    ``job_running`` once it starts, ``job_finished`` on a clean terminal state,
+    ``job_failed`` otherwise.  ``results.ready`` is emitted only after
+    ``job_finished`` and a present ``run_dir/simOutput``.
     """
 
     ACCEPTED = "accepted"
     SUBMITTED = "simulation.submitted"
     WORKFLOW_FINISHED = "workflow.finished"
+    JOB_RUNNING = "simulation.job_running"
+    JOB_FINISHED = "simulation.job_finished"
+    JOB_FAILED = "simulation.job_failed"
+    STEP_FINISHED = "simulation.step_finished"
+    RESULTS_READY = "results.ready"
     FAILED = "simulation.failed"
 
 
@@ -120,6 +135,14 @@ class SimulationStage(StrEnum):
     PREPARE = "prepare"
     SUBMIT = "submit"
     RUN = "run"
+
+
+#: Progress events at least this far apart (percent) are emitted; the terminal
+#: event is always emitted.  Matches the design's condensation (section 4.2).
+PROGRESS_EVENT_STEP_PERCENT = 25
+
+#: Log streams ``get_logs`` can request.
+LOG_STREAMS = ("stdout", "stderr", "workflow")
 
 
 class SubmitParams(BaseModel):
@@ -508,8 +531,18 @@ def build_submit_event(
     error_code: str | None = None,
     submit_system: str | None = None,
     results_linked: bool | None = None,
+    step: int | None = None,
+    percent: int | None = None,
+    walltime: str | None = None,
+    avg_per_step: str | None = None,
+    eta_s: int | None = None,
+    slurm_state: str | None = None,
+    exit_code: int | None = None,
 ) -> RcpMessage:
     """Build one M2 lifecycle event.
+
+    Only the fields relevant to the event's ``state`` are carried; the rest stay
+    absent so the payloads remain small and the room body readable.
 
     Returns:
         The unsigned ``rcp.simulation_event`` event.
@@ -526,11 +559,180 @@ def build_submit_event(
         payload["error_code"] = error_code
     if results_linked is not None:
         payload["results_linked"] = results_linked
+    payload.update(
+        {
+            key: value
+            for key, value in (
+                ("step", step),
+                ("percent", percent),
+                ("walltime", walltime),
+                ("avg_per_step", avg_per_step),
+                ("eta_s", eta_s),
+                ("slurm_state", slurm_state),
+                ("exit_code", exit_code),
+            )
+            if value is not None
+        },
+    )
     return RcpMessage(
         sim=sim,
         kind=Kind.EVENT,
         type=SimulationType.EVENT,
         seq=seq,
         sender_role=SenderRole.SIMCLIENT,
+        payload=payload,
+    )
+
+
+def build_status_command(
+    *,
+    sim: str,
+    seq: int,
+    sim_id: str,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient live-status request (M2b).
+
+    Returns:
+        The unsigned ``rcp.status_request`` command.
+
+    """
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.STATUS_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload={"cmd_id": cmd_id or new_cmd_id(), "sim_id": sim_id},
+    )
+
+
+def build_logs_command(
+    *,
+    sim: str,
+    seq: int,
+    sim_id: str,
+    stream: str = "stdout",
+    tail: int = 100,
+    cmd_id: str | None = None,
+    in_reply_to: str | None = None,
+) -> RcpMessage:
+    """Build the MCP-server-to-simclient log request (M2b).
+
+    Returns:
+        The unsigned ``rcp.logs_request`` command.
+
+    Raises:
+        ValueError: If ``stream`` is not one of :data:`LOG_STREAMS`.
+
+    """
+    if stream not in LOG_STREAMS:
+        msg = f"unknown log stream {stream!r}; expected one of {LOG_STREAMS}"
+        raise ValueError(msg)
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.COMMAND,
+        type=SimulationType.LOGS_COMMAND,
+        seq=seq,
+        sender_role=SenderRole.MCP_SERVER,
+        in_reply_to=in_reply_to,
+        payload={"cmd_id": cmd_id or new_cmd_id(), "sim_id": sim_id, "stream": stream, "tail": tail},
+    )
+
+
+def build_status_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    in_reply_to: str | None,
+    state: str,
+    slurm_state: str | None = None,
+    job_id: int | None = None,
+    step: int | None = None,
+    percent: int | None = None,
+    walltime: str | None = None,
+    avg_per_step: str | None = None,
+    eta_s: int | None = None,
+    exit_code: int | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's live-status response (M2b).
+
+    Returns:
+        The unsigned ``rcp.status_ack`` message.
+
+    """
+    payload: dict[str, Any] = {"cmd_id": cmd_id, "sim_id": sim_id, "state": state}
+    payload.update(
+        {
+            key: value
+            for key, value in (
+                ("slurm_state", slurm_state),
+                ("job_id", job_id),
+                ("step", step),
+                ("percent", percent),
+                ("walltime", walltime),
+                ("avg_per_step", avg_per_step),
+                ("eta_s", eta_s),
+                ("exit_code", exit_code),
+                ("error", error),
+                ("error_code", error_code),
+            )
+            if value is not None
+        },
+    )
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.STATUS_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
+        payload=payload,
+    )
+
+
+def build_logs_ack(
+    *,
+    sim: str,
+    seq: int,
+    cmd_id: str,
+    sim_id: str,
+    in_reply_to: str | None,
+    stream: str,
+    lines: list[str],
+    total_lines: int,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> RcpMessage:
+    """Build the simclient's log response (M2b).
+
+    Returns:
+        The unsigned ``rcp.logs_ack`` message.
+
+    """
+    payload: dict[str, Any] = {
+        "cmd_id": cmd_id,
+        "sim_id": sim_id,
+        "stream": stream,
+        "lines": lines,
+        "total_lines": total_lines,
+    }
+    if error:
+        payload["error"] = error
+    if error_code:
+        payload["error_code"] = error_code
+    return RcpMessage(
+        sim=sim,
+        kind=Kind.ACK,
+        type=SimulationType.LOGS_ACK,
+        seq=seq,
+        sender_role=SenderRole.SIMCLIENT,
+        in_reply_to=in_reply_to,
         payload=payload,
     )

@@ -4,13 +4,47 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Test double for ``scontrol show job <id>``."""
+r"""Test double for ``scontrol show job <id>``.
+
+The state file under ``FAKE_SLURM_STATE`` holds one or more *entries*, each one
+``STATE`` optionally followed by an integer exit code.  The original single
+entry (``COMPLETED 0`` or ``COMPLETED\n0``, as ``sbatch`` writes it) keeps being
+reported forever.  A file with several entries is a *sequence*: each invocation
+pops the first entry and writes the remainder back, so successive calls walk
+``PENDING`` -> ``RUNNING`` -> ``COMPLETED 0``.
+"""
 
 import os
 import sys
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("FAKE_SLURM_STATE", "/tmp/fake-slurm"))
+
+
+def parse_entries(lines: list[str]) -> list[tuple[str, int]]:
+    """Group the file's non-empty lines into ``(state, exit_code)`` entries.
+
+    A line that is a bare integer belongs to the preceding state line as its
+    exit code; any other line starts a new entry.
+
+    Args:
+        lines: The non-empty lines of the state file.
+
+    Returns:
+        The parsed entries, in file order.
+
+    """
+    entries: list[tuple[str, int]] = []
+    for line in lines:
+        token = line.split()
+        if not token:
+            continue
+        if len(token) == 1 and token[0].lstrip("-").isdigit() and entries:
+            state, _ = entries[-1]
+            entries[-1] = (state, int(token[0]))
+            continue
+        entries.append((token[0], int(token[1]) if len(token) > 1 else 0))
+    return entries
 
 
 def main(argv: list[str]) -> int:
@@ -23,9 +57,14 @@ def main(argv: list[str]) -> int:
     if not state_file.exists():
         print(f"scontrol: error: Job {job_id} not found", file=sys.stderr)
         return 1
-    lines = state_file.read_text(encoding="utf-8").split()
-    state = lines[0] if lines else "UNKNOWN"
-    exit_code = int(lines[1]) if len(lines) > 1 else 0
+    lines = [line for line in state_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    entries = parse_entries(lines)
+    if not entries:
+        entries = [("UNKNOWN", 0)]
+    state, exit_code = entries[0]
+    if len(entries) > 1:
+        remainder = "\n".join(f"{name} {code}" if code else name for name, code in entries[1:])
+        state_file.write_text(remainder + "\n", encoding="utf-8")
     # Mirror real `scontrol show job` layout: one attribute per line,
     # indented, JobId on the first line by itself.
     print(f"JobId={job_id} JobName=wrap")

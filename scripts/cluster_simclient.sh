@@ -33,7 +33,8 @@
 #   PIC_AGENTIC_PICONGPU_REVISION     pinned picongpu revision (drift check)
 #   PIC_AGENTIC_JOB_WAIT_TIMEOUT_S  default 600 (queue waits)
 #   PIC_AGENTIC_ACK_TIMEOUT_S  default 900
-#   PIC_AGENTIC_POLL_INTERVAL_S     default 2
+#   PIC_AGENTIC_POLL_INTERVAL_S     initial watcher poll interval, default 30
+#   PIC_AGENTIC_POLL_MAX_INTERVAL_S watcher backoff cap, default 300
 #   PIC_AGENTIC_SKIP_LOGIN=1   reuse an existing token config
 #   PIC_AGENTIC_NO_UPDATE=1    skip git fetch/pull
 #   PIC_AGENTIC_SKIP_SIM=1     install pic-agentic without the [sim] extra
@@ -54,7 +55,8 @@ CLUSTER_PRESET="${PIC_AGENTIC_CLUSTER_PRESET:-}"
 PICONGPU_REVISION="${PIC_AGENTIC_PICONGPU_REVISION:-91c3ee5fb4c9425b00d4673d9608f4370593cacf}"
 JOB_WAIT_S="${PIC_AGENTIC_JOB_WAIT_TIMEOUT_S:-600}"
 ACK_S="${PIC_AGENTIC_ACK_TIMEOUT_S:-900}"
-POLL_S="${PIC_AGENTIC_POLL_INTERVAL_S:-2}"
+POLL_S="${PIC_AGENTIC_POLL_INTERVAL_S:-30}"
+POLL_MAX_S="${PIC_AGENTIC_POLL_MAX_INTERVAL_S:-300}"
 REPO_URL="https://github.com/chillenzer-agents/pic-agentic.git"
 SRC="$WORKDIR/src"
 VENV="$WORKDIR/venv"
@@ -159,7 +161,7 @@ cat <<EOF
     room      : $ROOM_ID
     sim       : $SIM
     slurm     : $(command -v sbatch 2>/dev/null || echo 'sbatch NOT FOUND in PATH')
-    job wait  : ${JOB_WAIT_S}s   ack: ${ACK_S}s   poll: ${POLL_S}s
+    job wait  : ${JOB_WAIT_S}s   ack: ${ACK_S}s   poll: ${POLL_S}s..${POLL_MAX_S}s
     (leave this running; Ctrl-C to stop)
 EOF
 
@@ -181,6 +183,7 @@ fi
 export PIC_AGENTIC_JOB_WAIT_TIMEOUT_S="$JOB_WAIT_S"
 export PIC_AGENTIC_ACK_TIMEOUT_S="$ACK_S"
 export PIC_AGENTIC_POLL_INTERVAL_S="$POLL_S"
+export PIC_AGENTIC_POLL_MAX_INTERVAL_S="$POLL_MAX_S"
 export PIC_AGENTIC_CONFIG="$CONFIG"
 # Keep matrix-nio state off shared /tmp.
 export PIC_AGENTIC_NIO_STORE_DIR="${PIC_AGENTIC_NIO_STORE_DIR:-$WORKDIR/nio-store}"

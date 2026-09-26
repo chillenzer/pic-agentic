@@ -146,6 +146,9 @@ async def _run_submit(shared_dir, tmp_path, *, fake_runner, params=None):
     finally:
         serve_task.cancel()
         pump_task.cancel()
+        # Await the cancelled tasks so ``serve``'s ``finally`` reaps any
+        # in-flight follower subprocess before the event loop closes.
+        await asyncio.gather(serve_task, pump_task, return_exceptions=True)
         await sim_t.close()
         await mcp_t.close()
     return outcome, service
@@ -161,7 +164,11 @@ async def test_submit_round_trip(shared_dir, tmp_path, fake_runner) -> None:
     assert fake_runner[0].generated
     assert fake_runner[0].ran
 
-    events = service.events[outcome.cmd_id]
+    events = [
+        message
+        for message in service.event_log
+        if message.payload.get("sim_id") == outcome.sim_id and message.payload.get("cmd_id") == outcome.cmd_id
+    ]
     states = [event.payload["state"] for event in events]
     assert SimulationState.SUBMITTED.value in states
     assert SimulationState.WORKFLOW_FINISHED.value in states
