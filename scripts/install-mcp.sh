@@ -30,14 +30,14 @@
 set -euo pipefail
 
 # ---- pinned revision --------------------------------------------------------
-# Immutable 40-hex commit on chillenzer-agents/pic-agentic carrying the
-# non-blocking control plane + per-run stderr work this installer ships.
-# Bump deliberately; an override is allowed for testing but production must pin
-# a SHA.  NOTE: this is the wave2-g2 head the installer was authored against;
-# bump it to the final merge/release commit once that exists (the capability
-# preflight below refuses a pin that lacks the required simclient features, so
-# a stale pin fails loudly rather than silently installing the old client).
-PIC_AGENTIC_PIN="${PIC_AGENTIC_PIN:-7c2e6907b89b2bbe097b7d8788b9305d493f2de1}"
+# Immutable 40-hex commit on chillenzer-agents/pic-agentic carrying the full
+# M1-M4 stack (non-blocking control plane, results/plugin readers, agenda
+# research loop, fleet, auth) this installer ships.  Bump deliberately; an
+# override is allowed for testing but production must pin a SHA.  Pinned to the
+# main merge of the wave2-beta8 integration PR #8 (the capability preflight
+# below refuses a pin that lacks the required simclient features, so a stale pin
+# fails loudly rather than silently installing an old client).
+PIC_AGENTIC_PIN="${PIC_AGENTIC_PIN:-313d84d9e46a44d640c03e21a01e534d35eac7f8}"
 PIC_AGENTIC_REPO="${PIC_AGENTIC_REPO:-https://github.com/chillenzer-agents/pic-agentic}"
 RAW_REPO="${PIC_AGENTIC_RAW_REPO:-https://raw.githubusercontent.com/chillenzer-agents/pic-agentic}"
 
@@ -557,7 +557,7 @@ cat <<EOF
 NEXT:
   1. RESTART the opencode session so it loads the 'pic-agentic' MCP server.
   2. On the CLUSTER login node, start the simclient with THIS room + secret and
-     the SAME pinned stack (the default main branch cannot answer result reads):
+     the SAME pinned stack (main is now the M1-M4 integration tip):
        PIC_AGENTIC_BRANCH='$PIC_AGENTIC_PIN' \\
        PIC_AGENTIC_ROOM_ID='$ROOM_ID' \\
        PIC_AGENTIC_RCP_SECRET='<the same secret; do not paste it here>' \\

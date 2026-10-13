@@ -12,7 +12,7 @@
 # config, registers the MCP server with opencode and preflights it.
 #
 # Run it interactively (the device login needs a browser):
-#     git clone --branch wave2-beta8 https://github.com/chillenzer-agents/pic-agentic ~/pic-agentic-beta
+#     git clone https://github.com/chillenzer-agents/pic-agentic ~/pic-agentic-beta
 #     bash ~/pic-agentic-beta/scripts/beta-container-setup.sh fresh
 #
 # Then RESTART the opencode session so it picks up the new MCP server.
@@ -45,7 +45,7 @@ RCP_SECRET="${RCP_SECRET:-}"
 # Path convention only: the cluster simclient owns this dir; the server never
 # writes there (the inline M2 wire goes over Matrix).
 MESSAGE_DIR="${MESSAGE_DIR:-/home/lenz93/pic-agentic/shared}"
-BRANCH="${BRANCH:-wave2-beta8}"
+BRANCH="${BRANCH:-main}"
 REPO_URL="${REPO_URL:-https://github.com/chillenzer-agents/pic-agentic.git}"
 # Venv/cache live OUTSIDE any checkout so a clone-based run does not litter the
 # repo.  Override WORKDIR to relocate.
@@ -320,7 +320,7 @@ NEXT:
   1. RESTART the opencode session so it loads the 'pic-agentic' MCP server.
   2. Start the cluster-side simclient on the SAME pinned ref + room + secret
      (on the login node; see cluster_snippets.sh):
-       PIC_AGENTIC_BRANCH='wave2-beta8' \\
+       PIC_AGENTIC_BRANCH='main' \\
        PIC_AGENTIC_ROOM_ID='$ROOM_ID' \\
        PIC_AGENTIC_RCP_SECRET='$RCP_SECRET' bash cluster_simclient.sh
   3. Paste one of the beta prompts from docs/beta-test-prompts.md.
